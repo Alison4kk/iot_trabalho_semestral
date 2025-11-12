@@ -53,8 +53,8 @@ const int ADC_MAX = 1023;
 
 // Limiares padrão do trabalho (ajustáveis via CMD)
 struct Limiares {
-  float normal  = 30.0f; // abaixo de normal -> seco/vermelho
-  float encharcado = 70.0f; // acima de encharcado -> encharcado/azul
+  float sec_lo  = 30.0f; // abaixo de sec_lo -> seco/vermelho
+  float ok_hi = 70.0f; // acima de ok_hi -> encharcado/azul
 } limiares;
 
 const float HISTERESE_PCT = 2.0f;  // histerese para evitar "pisca"
@@ -84,7 +84,7 @@ void conectarMqttSeNecessario();
 void callbackMqtt(char* topico, byte* payload, unsigned int length);
 
 float lerUmidadePercentual(int* outAdc = nullptr);
-String classificarStatusLed(float pct); // usa limiares.normal/encharcado + histerese
+String classificarStatusLed(float pct); // usa limiares.sec_lo/ok_hi + histerese
 void atualizarLeds(const String& statusLed);
 
 void publicarEstadoOnline();
@@ -95,7 +95,7 @@ void publicarEventoMudancaStatus(const String& deStatus, const String& paraStatu
 void processarPayloadComando(const String& payload);
 bool aplicarLimiaresDoJson(JsonObject data);
 
-String obterStatusMonitoramento(); // Implementa a nova lógica (normal/atencao/critico)
+String obterStatusMonitoramento(const String& statusLed); // Implementa a nova lógica (sec_lo/atencao/critico)
 String agoraEpochStr();
 
 // ====================== SETUP ====================== //
@@ -276,20 +276,20 @@ float lerUmidadePercentual(int* outAdc) {
 String classificarStatusLed(float pct) {
   // Implementa histerese para evitar "pisca-pisca" nas bordas
   if (statusLedAtual == STATUS_SECO) {
-    if (pct < limiares.normal + HISTERESE_PCT) return STATUS_SECO;
+    if (pct < limiares.sec_lo + HISTERESE_PCT) return STATUS_SECO;
   }
   if (statusLedAtual == STATUS_ADEQUADO) {
-    if (pct >= (limiares.normal - HISTERESE_PCT) && pct <= (limiares.encharcado + HISTERESE_PCT))
+    if (pct >= (limiares.sec_lo - HISTERESE_PCT) && pct <= (limiares.ok_hi + HISTERESE_PCT))
       return STATUS_ADEQUADO;
   }
   if (statusLedAtual == STATUS_ENCHARCADO) {
-    if (pct > limiares.encharcado - HISTERESE_PCT) return STATUS_ENCHARCADO;
+    if (pct > limiares.ok_hi - HISTERESE_PCT) return STATUS_ENCHARCADO;
   }
 
   // Classificação direta (fallback ou primeira classificação)
-  if (pct < limiares.normal)       return STATUS_SECO;
-  if (pct <= limiares.encharcado)       return STATUS_ADEQUADO;
-  /* pct > limiares.encharcado */        return STATUS_ENCHARCADO;
+  if (pct < limiares.sec_lo)       return STATUS_SECO;
+  if (pct <= limiares.ok_hi)       return STATUS_ADEQUADO;
+  /* pct > limiares.ok_hi */        return STATUS_ENCHARCADO;
 }
 
 // Atualiza o estado dos pinos de LED com base no status
@@ -306,26 +306,14 @@ void atualizarLeds(const String& status) {
 }
 
 // Implementa a lógica de status de monitoramento baseado no tempo seco
-String obterStatusMonitoramento() {
-  if (inicioStatusSecoMs == 0) {
-    // Se não está em status "seco", é "normal"
-    return "normal";
-  }
-
-  const unsigned long DURACAO_ATENCAO_MS = 5000UL;  // 5 segundos
-  const unsigned long DURACAO_CRITICO_MS = 10000UL; // 10 segundos
-
-  unsigned long tempoSecoMs = millis() - inicioStatusSecoMs;
-
-  if (tempoSecoMs >= DURACAO_CRITICO_MS) {
+String obterStatusMonitoramento(const String& statusLed) {
+  if (statusLed == STATUS_SECO) {
     return "critico";
-  }
-  if (tempoSecoMs >= DURACAO_ATENCAO_MS) {
+  } else if (statusLed == STATUS_ADEQUADO) {
+    return "normal"; 
+  } else {
     return "atencao";
   }
-
-  // Seco, mas por menos de 5 segundos
-  return "normal"; 
 }
 
 // ====================== PUBLICAÇÕES MQTT ====================== //
@@ -348,8 +336,8 @@ void publicarConfiguracao() {
 
   // Objeto 'thresholds' (Payload JSON em inglês)
   JsonObject t = doc.createNestedObject("thresholds");
-  t["normal"]  = limiares.normal;  // < normal -> seco
-  t["encharcado"] = limiares.encharcado; // > encharcado -> encharcado
+  t["sec_lo"]  = limiares.sec_lo;  // < sec_lo -> seco
+  t["ok_hi"] = limiares.ok_hi; // > ok_hi -> encharcado
 
   JsonObject misc = doc.createNestedObject("misc");
   misc["telemetry_interval_ms"] = INTERVALO_TELEMETRIA_MS;
@@ -390,16 +378,15 @@ void publicarTelemetria(bool forcarEnvio, float pct, int adc, const String& stat
 
   // Métricas: dados da leitura (Payload JSON em inglês)
   JsonObject metrics = doc.createNestedObject("metrics");
-  metrics["pct"] = pct;
-  metrics["raw"] = adc;
+  metrics["umid_pct"] = pct;
+  metrics["classe"] = statusLed;
 
   // Status de monitoramento e limiares (Payload JSON em inglês)
-  doc["status"]       = obterStatusMonitoramento(); // "normal|atencao|critico"
-  doc["status_led"]   = statusLed;    // Estado do LED (seco|adequado|encharcado)
+  doc["status"] = obterStatusMonitoramento(statusLed); // "normal|atencao|critico"
 
   JsonObject th = doc.createNestedObject("thresholds");
-  th["normal"]  = limiares.normal;
-  th["encharcado"] = limiares.encharcado;
+  th["sec_lo"]  = limiares.sec_lo;
+  th["ok_hi"] = limiares.ok_hi;
   
   char buf[550]; 
   size_t n = serializeJson(doc, buf, sizeof(buf));
@@ -515,16 +502,16 @@ void processarPayloadComando(const String& payload) {
 // Aplica os novos limiares se forem válidos
 bool aplicarLimiaresDoJson(JsonObject data) {
   // Aceita campos opcionais: "normal", "encharcado" (float 0–100)
-  float novoBaixo  = data.containsKey("normal")  ? data["normal"].as<float>()  : limiares.normal;
-  float novoAlto = data.containsKey("encharcado") ? data["encharcado"].as<float>() : limiares.encharcado;
+  float novoBaixo  = data.containsKey("sec_lo")  ? data["sec_lo"].as<float>()  : limiares.sec_lo;
+  float novoAlto = data.containsKey("ok_hi") ? data["ok_hi"].as<float>() : limiares.ok_hi;
 
   if (isnan(novoBaixo) || isnan(novoAlto)) return false;
   if (novoBaixo < 0.0f || novoBaixo > 100.0f) return false;
   if (novoAlto < 0.0f || novoAlto > 100.0f) return false;
-  if (novoBaixo >= novoAlto) return false; // Limiar 'normal' deve ser sempre menor que 'encharcado'
+  if (novoBaixo >= novoAlto) return false; // Limiar 'sec_lo' deve ser sempre menor que 'encharcado'
 
-  limiares.normal = novoBaixo;
-  limiares.encharcado = novoAlto;
+  limiares.sec_lo = novoBaixo;
+  limiares.ok_hi = novoAlto;
   return true;
 }
 
